@@ -1,0 +1,2 @@
+# first rusberry
+print('hello')
