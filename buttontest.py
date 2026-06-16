@@ -34,8 +34,8 @@ LED_INVERT     = False    # True if using an inverting level shifter
 LED_CHANNEL    = 0        # PWM channel (0 for GPIO18 primary, but we use GPIO2/3 via DMA)
 
 # GPIO pins for each strip's data line (BCM numbering)
-STRIP1_PIN = 2   # Physical pin 3  / WiringPi 8
-STRIP2_PIN = 3   # Physical pin 5  / WiringPi 9
+STRIP1_PIN = 12   # Physical pin 3  / WiringPi 8
+STRIP2_PIN = 13   # Physical pin 5  / WiringPi 9
 
 # GPIO pins for buttons (BCM numbering)
 BTN1_PIN = 17    # Physical pin 11 / WiringPi 0
