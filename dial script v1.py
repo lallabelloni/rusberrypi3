@@ -4,13 +4,12 @@ Lamp intercom controller — Raspberry Pi 3 Model B
 --------------------------------------------------
 Hardware (BCM GPIO numbering):
 
-  LED strip 1  DIN → BCM GPIO12 (physical pin 32)
-  LED strip 2  DIN → BCM GPIO13 (physical pin 33)
-  Button DIAL      → BCM GPIO17 (physical pin 11)
-  Button RECORD    → BCM GPIO18 (physical pin 12)
-  Button PLAY      → BCM GPIO27 (physical pin 13)
-  Speaker          → 3.5mm audio jack (plughw:1,0)
-  Mic              → USB (plughw:2,0)
+  LED strips (x2 chained) DIN → GPIO18 (physical pin 12)
+  Button DIAL                 → BCM GPIO17 (physical pin 11)
+  Button RECORD               → BCM GPIO24 (physical pin 18)
+  Button PLAY                 → BCM GPIO27 (physical pin 13)
+  Speaker                     → 3.5mm audio jack (plughw:1,0)
+  Mic                         → USB (plughw:2,0)
 
 LED states:
   Idle             → warm white (static)
@@ -20,7 +19,7 @@ LED states:
   Playing message  → blue
 
 Requirements:
-  sudo pip3 install rpi_ws281x RPi.GPIO --break-system-packages
+  sudo pip3 install neopixel RPi.GPIO --break-system-packages
   baresip must be running with ctrl_tcp_listen 127.0.0.1:4444
 
 Run with sudo:
@@ -34,8 +33,9 @@ import socket
 import subprocess
 import os
 import threading
+import board
+import neopixel
 import RPi.GPIO as GPIO
-from rpi_ws281x import PixelStrip, Color
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -52,68 +52,65 @@ MIC_DEVICE     = "plughw:2,0"
 SPEAKER_DEVICE = "plughw:1,0"
 
 BTN_DIAL       = 17
-BTN_RECORD     = 18
+BTN_RECORD     = 24
 BTN_PLAY       = 27
 
 # ── LED configuration ──────────────────────────────────────────────────────
 
-LED_COUNT      = 12
-LED_FREQ_HZ    = 800000
-LED_DMA        = 10
-LED_BRIGHTNESS = 128
-LED_INVERT     = False
+LED_PIN        = board.D18
+LEDS_PER_STRIP = 15
+STRIP_COUNT    = 2
+LED_TOTAL      = LEDS_PER_STRIP * STRIP_COUNT
+LED_BRIGHTNESS = 0.3
 
-STRIP1_PIN     = 12
-STRIP2_PIN     = 13
-
-# Colors
-COLOR_IDLE     = Color(255, 147, 41)   # warm white
-COLOR_CALL     = Color(0,   255,  0)   # green
-COLOR_RECORD   = Color(255,   0,  0)   # red
-COLOR_PLAY     = Color(0,     0, 255)  # blue
-COLOR_OFF      = Color(0,     0,  0)
+# Colors (R, G, B)
+COLOR_IDLE     = (255, 147, 41)   # warm white
+COLOR_CALL     = (0,   255,  0)   # green
+COLOR_RECORD   = (255,   0,  0)   # red
+COLOR_PLAY     = (0,     0, 255)  # blue
+COLOR_OFF      = (0,     0,  0)
 
 # ── State ──────────────────────────────────────────────────────────────────
 in_call        = False
 is_recording   = False
 record_proc    = None
 play_proc      = None
-
-# LED flash thread control
-flash_thread   = None
 flash_active   = False
 
+# ── LED setup ──────────────────────────────────────────────────────────────
+pixels = neopixel.NeoPixel(
+    LED_PIN, LED_TOTAL,
+    brightness=LED_BRIGHTNESS,
+    auto_write=False
+)
+
 # ── LED helpers ────────────────────────────────────────────────────────────
-def fill_strips(strip1, strip2, color):
-    for i in range(LED_COUNT):
-        strip1.setPixelColor(i, color)
-        strip2.setPixelColor(i, color)
-    strip1.show()
-    strip2.show()
+def fill_pixels(color):
+    pixels.fill(color)
+    pixels.show()
 
-def set_idle(strip1, strip2):
-    global flash_active
-    flash_active = False
-    time.sleep(0.05)  # let flash thread stop
-    fill_strips(strip1, strip2, COLOR_IDLE)
-
-def set_color(strip1, strip2, color):
+def set_idle():
     global flash_active
     flash_active = False
     time.sleep(0.05)
-    fill_strips(strip1, strip2, color)
+    fill_pixels(COLOR_IDLE)
 
-def start_flash(strip1, strip2):
-    global flash_thread, flash_active
+def set_color(color):
+    global flash_active
+    flash_active = False
+    time.sleep(0.05)
+    fill_pixels(color)
+
+def start_flash():
+    global flash_active
     flash_active = True
     def _flash():
         state = True
         while flash_active:
-            fill_strips(strip1, strip2, COLOR_IDLE if state else COLOR_OFF)
+            fill_pixels(COLOR_IDLE if state else COLOR_OFF)
             state = not state
             time.sleep(0.4)
-    flash_thread = threading.Thread(target=_flash, daemon=True)
-    flash_thread.start()
+    threading.Thread(target=_flash, daemon=True).start()
 
 # ── Baresip control ────────────────────────────────────────────────────────
 def baresip_cmd(cmd):
@@ -127,9 +124,8 @@ def baresip_cmd(cmd):
     except Exception as e:
         print(f"[baresip] ERROR sending '{cmd}': {e}")
 
-# ── Baresip event listener (detects incoming calls) ────────────────────────
-def start_event_listener(strip1, strip2):
-    """Listen on baresip control socket for incoming call events."""
+# ── Baresip event listener ─────────────────────────────────────────────────
+def start_event_listener():
     def _listen():
         while True:
             try:
@@ -142,47 +138,46 @@ def start_event_listener(strip1, strip2):
                         break
                     if "INCOMING" in data or "CALL_INCOMING" in data:
                         print("[EVENT] Incoming call — flashing")
-                        start_flash(strip1, strip2)
+                        start_flash()
                     elif "CALL_ESTABLISHED" in data:
                         print("[EVENT] Call established — green")
-                        set_color(strip1, strip2, COLOR_CALL)
+                        set_color(COLOR_CALL)
                     elif "CALL_CLOSED" in data:
                         print("[EVENT] Call ended — idle")
                         global in_call
                         in_call = False
-                        set_idle(strip1, strip2)
+                        set_idle()
                 s.close()
             except Exception:
-                time.sleep(2)  # retry on disconnect
-    t = threading.Thread(target=_listen, daemon=True)
-    t.start()
+                time.sleep(2)
+    threading.Thread(target=_listen, daemon=True).start()
 
 # ── Button actions ─────────────────────────────────────────────────────────
-def action_dial(strip1, strip2):
+def action_dial():
     global in_call
     if not in_call:
         print("[DIAL] Calling other lamp...")
         baresip_cmd(f"/dial sip:{REMOTE_USER}@{REMOTE_IP}")
         in_call = True
-        set_color(strip1, strip2, COLOR_CALL)
+        set_color(COLOR_CALL)
     else:
         print("[DIAL] Hanging up...")
         baresip_cmd("/hangup")
         in_call = False
-        set_idle(strip1, strip2)
+        set_idle()
 
-def action_record_start(strip1, strip2):
+def action_record_start():
     global is_recording, record_proc
     if is_recording or in_call:
         return
     print(f"[RECORD] Recording to {MESSAGE_PATH}...")
-    set_color(strip1, strip2, COLOR_RECORD)
+    set_color(COLOR_RECORD)
     record_proc = subprocess.Popen([
-        "arecord", "-D", MIC_DEVICE, "-f", "cd", "-t", "wav", MESSAGE_PATH
+        "arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", "44100", "-c", "1", "-t", "wav", MESSAGE_PATH
     ])
     is_recording = True
 
-def action_record_stop(strip1, strip2):
+def action_record_stop():
     global is_recording, record_proc
     if not is_recording or record_proc is None:
         return
@@ -191,9 +186,9 @@ def action_record_stop(strip1, strip2):
     record_proc = None
     is_recording = False
     print("[RECORD] Saved.")
-    set_idle(strip1, strip2)
+    set_idle()
 
-def action_play(strip1, strip2):
+def action_play():
     global play_proc
     if in_call or is_recording:
         return
@@ -203,15 +198,16 @@ def action_play(strip1, strip2):
     if play_proc and play_proc.poll() is None:
         play_proc.terminate()
         play_proc.wait()
+        time.sleep(0.3)
     print(f"[PLAY] Playing {MESSAGE_PATH}...")
-    set_color(strip1, strip2, COLOR_PLAY)
+    set_color(COLOR_PLAY)
     play_proc = subprocess.Popen([
         "aplay", "-D", SPEAKER_DEVICE, MESSAGE_PATH
     ])
-    # Return to idle when playback finishes
     def _wait():
         play_proc.wait()
-        set_idle(strip1, strip2)
+        time.sleep(0.3)
+        set_idle()
     threading.Thread(target=_wait, daemon=True).start()
 
 # ── GPIO setup ─────────────────────────────────────────────────────────────
@@ -221,42 +217,32 @@ def setup_buttons():
     for pin in (BTN_DIAL, BTN_RECORD, BTN_PLAY):
         GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-def setup_strips():
-    strip1 = PixelStrip(LED_COUNT, STRIP1_PIN, LED_FREQ_HZ, LED_DMA,
-                        LED_INVERT, LED_BRIGHTNESS, 0)
-    strip2 = PixelStrip(LED_COUNT, STRIP2_PIN, LED_FREQ_HZ, LED_DMA + 1,
-                        LED_INVERT, LED_BRIGHTNESS, 1)
-    strip1.begin()
-    strip2.begin()
-    return strip1, strip2
-
 # ── Cleanup ────────────────────────────────────────────────────────────────
-def cleanup(strip1, strip2):
+def cleanup():
     global flash_active
     print("\n[EXIT] Cleaning up...")
     flash_active = False
-    action_record_stop(strip1, strip2)
+    action_record_stop()
     if in_call:
         baresip_cmd("/hangup")
-    fill_strips(strip1, strip2, COLOR_OFF)
+    fill_pixels(COLOR_OFF)
     GPIO.cleanup()
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
-    strip1, strip2 = setup_strips()
     setup_buttons()
-    set_idle(strip1, strip2)
-    start_event_listener(strip1, strip2)
+    set_idle()
+    start_event_listener()
 
     def handle_exit(sig, frame):
-        cleanup(strip1, strip2)
+        cleanup()
         sys.exit(0)
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
     print("Lamp controller ready.")
     print("  BTN_DIAL   (BCM17) — call / hang up")
-    print("  BTN_RECORD (BCM18) — hold to record")
+    print("  BTN_RECORD (BCM24) — hold to record")
     print("  BTN_PLAY   (BCM27) — play last message")
     print("Ctrl+C to quit.\n")
 
@@ -275,15 +261,15 @@ def main():
                 time.sleep(0.02)
                 if GPIO.input(pin) == GPIO.LOW:
                     if pin == BTN_DIAL:
-                        action_dial(strip1, strip2)
+                        action_dial()
                     elif pin == BTN_RECORD:
-                        action_record_start(strip1, strip2)
+                        action_record_start()
                     elif pin == BTN_PLAY:
-                        action_play(strip1, strip2)
+                        action_play()
 
             if current == GPIO.HIGH and prev == GPIO.LOW:
                 if pin == BTN_RECORD:
-                    action_record_stop(strip1, strip2)
+                    action_record_stop()
 
             last_state[pin] = current
 
