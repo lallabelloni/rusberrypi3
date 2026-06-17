@@ -123,6 +123,28 @@ record_proc    = None
 play_proc      = None
 flash_active   = False
 _current_color = None   # track last LED color to avoid redundant writes
+
+# ── remove led calls ──────────────────────────────────────────────────────────────────
+def fill_pixels(color):
+    pass  # LED disabled
+
+def set_idle():
+    global flash_active
+    flash_active = False
+    # fill_pixels(COLOR_IDLE)
+
+def set_color(color):
+    global flash_active
+    flash_active = False
+    # fill_pixels(color)
+
+def flash_error():
+    pass  # LED disabled
+
+def start_flash():
+    pass  # LED disabled
+# ───────────────────────────────────────────────────────────────────
+
 # ── LED setup ──────────────────────────────────────────────────────────────
 try:
     pixels = neopixel.NeoPixel(
