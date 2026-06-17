@@ -265,9 +265,10 @@ def start_baresip(wait_secs=5):
         print("[baresip] starting baresip -d ...")
         try:
             _baresip_proc = subprocess.Popen(
-                ["baresip", "-d"],
+                ["/usr/bin/baresip", "-d"],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
+                 env={**os.environ, "HOME": "/home/group66"}
             )
         except FileNotFoundError:
             print("[baresip] ERROR: baresip not found — install it first")
