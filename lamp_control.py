@@ -199,117 +199,124 @@ def start_flash():
         fill_pixels(COLOR_OFF)
     threading.Thread(target=_flash, daemon=True).start()
 
-# ── Baresip control ────────────────────────────────────────────────────────
+# ── Baresip — single shared persistent connection ──────────────────────────
+#
+# baresip ctrl_tcp accepts only ONE connection at a time.
+# We keep one persistent socket open for both sending commands and
+# receiving events. A background thread owns the socket and reads
+# events; commands are written onto the same socket via a lock.
 
-def baresip_cmd(cmd, retries=2):
+_baresip_proc  = None          # subprocess handle if we launched baresip
+_bs_socket     = None          # the single live socket
+_bs_lock       = threading.Lock()
+_bs_connected  = threading.Event()   # set when socket is live
+
+def start_baresip(wait_secs=8):
     """
-    Send a command to baresip over TCP. Retries on failure.
-    Returns True if sent successfully, False otherwise.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            s.connect((BARESIP_HOST, BARESIP_PORT))
-            s.send((cmd + "\n").encode())
-            s.close()
-            print(f"[baresip] sent: {cmd}")
-            return True
-        except ConnectionRefusedError:
-            print(f"[baresip] ERROR: connection refused — is baresip running? (attempt {attempt}/{retries})")
-        except socket.timeout:
-            print(f"[baresip] ERROR: timeout sending '{cmd}' (attempt {attempt}/{retries})")
-        except OSError as e:
-            print(f"[baresip] ERROR: {e} (attempt {attempt}/{retries})")
-        if attempt < retries:
-            time.sleep(0.5)
-    print(f"[baresip] gave up sending: {cmd}")
-    return False
-
-def baresip_running():
-    """Quick check: can we reach the baresip control socket?"""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1)
-        s.connect((BARESIP_HOST, BARESIP_PORT))
-        s.close()
-        return True
-    except Exception:
-        return False
-
-# Module-level handle so cleanup() can kill baresip on exit
-_baresip_proc = None
-
-def start_baresip(wait_secs=5):
-    """
-    Launch baresip -d as a background process if it isn't already running.
-    Waits up to wait_secs for the control socket to become available.
-    Returns True if baresip is ready, False if it failed to start.
+    Launch baresip -d if not already running.
+    Returns True once the control socket is reachable.
     """
     global _baresip_proc
 
-    if baresip_running():
-        print("[baresip] already running")
+    if _bs_connected.is_set():
+        print("[baresip] already connected")
         return True
 
-    # Check if a baresip process already exists (started externally)
+    # Try a quick probe first (externally started baresip)
     try:
-        result = subprocess.run(["pgrep", "-x", "baresip"],
-                                capture_output=True, text=True)
-        if result.returncode == 0:
-            print("[baresip] process exists but socket not ready yet — waiting...")
+        probe = socket.create_connection((BARESIP_HOST, BARESIP_PORT), timeout=1)
+        probe.close()
+        print("[baresip] already reachable")
+        return True
     except Exception:
         pass
 
+    # Launch it ourselves
     if _baresip_proc is None or _baresip_proc.poll() is not None:
-        print("[baresip] starting baresip -d ...")
+        print("[baresip] launching /usr/bin/baresip -d ...")
         try:
             _baresip_proc = subprocess.Popen(
                 ["/usr/bin/baresip", "-d"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                 env={**os.environ, "HOME": "/home/group66"}
+                env={**os.environ, "HOME": "/home/group66"}
             )
         except FileNotFoundError:
-            print("[baresip] ERROR: baresip not found — install it first")
+            print("[baresip] ERROR: /usr/bin/baresip not found")
             return False
         except Exception as e:
             print(f"[baresip] ERROR launching: {e}")
             return False
 
-    # Wait for socket to become available
+    # Wait for socket to open
     deadline = time.time() + wait_secs
     while time.time() < deadline:
-        if baresip_running():
-            print("[baresip] ready")
+        try:
+            probe = socket.create_connection((BARESIP_HOST, BARESIP_PORT), timeout=1)
+            probe.close()
+            print("[baresip] socket is up")
             return True
-        time.sleep(0.5)
+        except Exception:
+            time.sleep(0.5)
 
     print(f"[baresip] did not become ready within {wait_secs}s")
     return False
 
-# ── Baresip event listener ─────────────────────────────────────────────────
+def baresip_running():
+    return _bs_connected.is_set()
+
+def baresip_cmd(cmd):
+    """
+    Send a command on the shared persistent socket.
+    Returns True on success.
+    """
+    global _bs_socket
+    with _bs_lock:
+        if _bs_socket is None:
+            print(f"[baresip] not connected — cannot send: {cmd}")
+            return False
+        try:
+            _bs_socket.sendall((cmd + "\n").encode())
+            print(f"[baresip] sent: {cmd}")
+            return True
+        except Exception as e:
+            print(f"[baresip] send error: {e}")
+            return False
 
 def start_event_listener():
-    """Listen for baresip events in a background thread."""
+    """
+    Background thread: maintains the single persistent socket to baresip.
+    Reads events and dispatches them; commands are sent via baresip_cmd()
+    on the same socket using _bs_lock.
+    """
     def _listen():
-        global in_call
+        global in_call, _bs_socket
         backoff = 2
         while True:
+            # Wait until baresip is reachable
+            while True:
+                try:
+                    sock = socket.create_connection((BARESIP_HOST, BARESIP_PORT), timeout=3)
+                    sock.settimeout(None)   # blocking reads from here
+                    break
+                except Exception:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+
+            with _bs_lock:
+                _bs_socket = sock
+            _bs_connected.set()
+            backoff = 2
+            print("[baresip] connected (shared socket)")
+
+            buf = ""
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(10)
-                s.connect((BARESIP_HOST, BARESIP_PORT))
-                backoff = 2   # reset backoff on successful connect
-                print("[EVENT] Connected to baresip")
-                buf = ""
                 while True:
-                    chunk = s.recv(1024).decode(errors="ignore")
+                    chunk = sock.recv(1024).decode(errors="ignore")
                     if not chunk:
-                        print("[EVENT] Socket closed by baresip")
+                        print("[baresip] socket closed by remote")
                         break
                     buf += chunk
-                    # Process line by line
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         line = line.strip()
@@ -318,7 +325,7 @@ def start_event_listener():
                         print(f"[EVENT] {line}")
                         if "INCOMING" in line or "CALL_INCOMING" in line:
                             print("[EVENT] Incoming call — flashing")
-                            in_call = False   # not established yet
+                            in_call = False
                             start_flash()
                         elif "CALL_ESTABLISHED" in line:
                             print("[EVENT] Call established")
@@ -328,19 +335,19 @@ def start_event_listener():
                             print("[EVENT] Call ended")
                             in_call = False
                             set_idle()
-                        elif "CALL_LOCAL_SDP" in line or "CALL_REMOTE_SDP" in line:
-                            pass   # noisy, ignore
-                s.close()
-            except socket.timeout:
-                print("[EVENT] Socket timeout — retrying")
-            except ConnectionRefusedError:
-                print(f"[EVENT] baresip not reachable — retrying in {backoff}s")
-            except OSError as e:
-                print(f"[EVENT] Socket error: {e} — retrying in {backoff}s")
             except Exception as e:
-                print(f"[EVENT] Unexpected error: {e} — retrying in {backoff}s")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)   # exponential backoff, cap at 30s
+                print(f"[baresip] socket error: {e}")
+            finally:
+                with _bs_lock:
+                    _bs_socket = None
+                _bs_connected.clear()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                print(f"[baresip] reconnecting in {backoff}s...")
+                time.sleep(backoff)
+
     threading.Thread(target=_listen, daemon=True).start()
 
 # ── Button actions ─────────────────────────────────────────────────────────
@@ -349,14 +356,19 @@ def action_dial():
     """Dial the other lamp or hang up if already in call."""
     global in_call
 
-    if not baresip_running():
-        print("[DIAL] baresip not running — attempting to start it...")
-        fill_pixels(COLOR_ERROR)   # visual cue: starting up
-        if not start_baresip(wait_secs=6):
+    if not _bs_connected.is_set():
+        print("[DIAL] baresip not connected — attempting to start...")
+        fill_pixels(COLOR_ERROR)
+        if not start_baresip(wait_secs=8):
             print("[DIAL] could not start baresip — giving up")
             flash_error()
             return
-        print("[DIAL] baresip started OK")
+        # Wait for the event listener to connect the shared socket
+        if not _bs_connected.wait(timeout=6):
+            print("[DIAL] socket not ready after start — giving up")
+            flash_error()
+            return
+        print("[DIAL] baresip ready")
 
     if not in_call:
         target = f"sip:{REMOTE_USER}@{REMOTE_IP}"
@@ -570,10 +582,14 @@ def main():
     signal.signal(signal.SIGINT,  handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
-    # Start baresip at launch — don't wait for dial button
+    # Start baresip then wait for event listener to connect the shared socket
     print("[baresip] checking / starting baresip...")
     if start_baresip(wait_secs=8):
-        print("[baresip] ready at startup")
+        print("[baresip] process up — waiting for socket...")
+        if _bs_connected.wait(timeout=8):
+            print("[baresip] ready at startup")
+        else:
+            print("[WARN] baresip started but socket not ready yet — will connect soon")
     else:
         print("[WARN] baresip not ready — will retry when DIAL is pressed")
 
