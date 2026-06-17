@@ -237,6 +237,56 @@ def baresip_running():
     except Exception:
         return False
 
+# Module-level handle so cleanup() can kill baresip on exit
+_baresip_proc = None
+
+def start_baresip(wait_secs=5):
+    """
+    Launch baresip -d as a background process if it isn't already running.
+    Waits up to wait_secs for the control socket to become available.
+    Returns True if baresip is ready, False if it failed to start.
+    """
+    global _baresip_proc
+
+    if baresip_running():
+        print("[baresip] already running")
+        return True
+
+    # Check if a baresip process already exists (started externally)
+    try:
+        result = subprocess.run(["pgrep", "-x", "baresip"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            print("[baresip] process exists but socket not ready yet — waiting...")
+    except Exception:
+        pass
+
+    if _baresip_proc is None or _baresip_proc.poll() is not None:
+        print("[baresip] starting baresip -d ...")
+        try:
+            _baresip_proc = subprocess.Popen(
+                ["baresip", "-d"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except FileNotFoundError:
+            print("[baresip] ERROR: baresip not found — install it first")
+            return False
+        except Exception as e:
+            print(f"[baresip] ERROR launching: {e}")
+            return False
+
+    # Wait for socket to become available
+    deadline = time.time() + wait_secs
+    while time.time() < deadline:
+        if baresip_running():
+            print("[baresip] ready")
+            return True
+        time.sleep(0.5)
+
+    print(f"[baresip] did not become ready within {wait_secs}s")
+    return False
+
 # ── Baresip event listener ─────────────────────────────────────────────────
 
 def start_event_listener():
@@ -299,9 +349,13 @@ def action_dial():
     global in_call
 
     if not baresip_running():
-        print("[DIAL] baresip not running — cannot dial")
-        flash_error()
-        return
+        print("[DIAL] baresip not running — attempting to start it...")
+        fill_pixels(COLOR_ERROR)   # visual cue: starting up
+        if not start_baresip(wait_secs=6):
+            print("[DIAL] could not start baresip — giving up")
+            flash_error()
+            return
+        print("[DIAL] baresip started OK")
 
     if not in_call:
         target = f"sip:{REMOTE_USER}@{REMOTE_IP}"
@@ -490,6 +544,15 @@ def cleanup():
     except Exception as e:
         print(f"[EXIT] GPIO cleanup error: {e}")
 
+    # Kill baresip if we launched it
+    if _baresip_proc and _baresip_proc.poll() is None:
+        print("[EXIT] Stopping baresip...")
+        try:
+            _baresip_proc.terminate()
+            _baresip_proc.wait(timeout=3)
+        except Exception:
+            _baresip_proc.kill()
+
     print("[EXIT] Done.")
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -506,10 +569,12 @@ def main():
     signal.signal(signal.SIGINT,  handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
-    # Warn if baresip isn't reachable at startup
-    if not baresip_running():
-        print("[WARN] baresip not reachable on startup — dial button will not work until it is running")
-        print("[WARN] Start it with: baresip -d")
+    # Start baresip at launch — don't wait for dial button
+    print("[baresip] checking / starting baresip...")
+    if start_baresip(wait_secs=8):
+        print("[baresip] ready at startup")
+    else:
+        print("[WARN] baresip not ready — will retry when DIAL is pressed")
 
     print("\n══════════════════════════════════════")
     print("  Lamp intercom controller ready")
