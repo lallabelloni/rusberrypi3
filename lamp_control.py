@@ -236,11 +236,10 @@ def start_baresip(wait_secs=8):
         print("[baresip] launching /usr/bin/baresip -d ...")
         try:
             _baresip_proc = subprocess.Popen(
-                ["/usr/bin/baresip", "-d"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env={**os.environ, "HOME": "/home/group66"}
-            )
+    ["/usr/bin/baresip", "-d", "-f", "/home/group66/.baresip"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
         except FileNotFoundError:
             print("[baresip] ERROR: /usr/bin/baresip not found")
             return False
