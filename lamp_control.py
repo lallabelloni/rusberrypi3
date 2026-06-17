@@ -239,7 +239,7 @@ def start_baresip(wait_secs=8):
     ["/usr/bin/baresip", "-d", "-f", "/home/group66/.baresip"],
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
-)
+            )
         except FileNotFoundError:
             print("[baresip] ERROR: /usr/bin/baresip not found")
             return False
