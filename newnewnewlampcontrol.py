@@ -8,7 +8,7 @@ HARDWARE WIRING (BCM GPIO numbering / physical pin):
   Physical Pin 4  (5V)       → SN74LS125AN Pin 14 (VCC)
   Physical Pin 9  (GND)      → SN74LS125AN Pin 7 (GND)  [shared ground bus]
   Physical Pin 11 (GPIO 17)  → Button DIAL   (other leg to GND)
-  Physical Pin 12 (GPIO 18)  → LED data signal
+  Physical Pin 19 (GPIO 10)  → LED data signal
   Physical Pin 13 (GPIO 27)  → Button PLAY   (other leg to GND)
   Physical Pin 14 (GND)      → all buttons other leg (common GND)
   Physical Pin 18 (GPIO 24)  → Button RECORD (other leg to GND)
@@ -95,7 +95,7 @@ BTN_DIAL       = 17   # Physical pin 11
 BTN_RECORD     = 24   # Physical pin 18
 BTN_PLAY       = 27   # Physical pin 13
 
-LED_PIN        = board.D18
+LED_PIN        = board.D10
 LEDS_PER_STRIP = 15
 STRIP_COUNT    = 2
 LED_TOTAL      = LEDS_PER_STRIP * STRIP_COUNT   # 30
