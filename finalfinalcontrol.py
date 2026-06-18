@@ -94,7 +94,7 @@ SPEAKER_DEVICE = "plughw:1,0"
 BTN_DIAL       = 17   # Physical pin 11
 BTN_RECORD     = 24   # Physical pin 18
 BTN_PLAY       = 27   # Physical pin 13
-BTN_COLOR      = 22   # Physical pin 15 (not used in this version)
+BTN_COLOR      = 22   # Physical pin 15 
 
 LED_PIN        = board.D10
 LEDS_PER_STRIP = 15
