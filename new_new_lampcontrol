@@ -18,6 +18,7 @@ HARDWARE WIRING (BCM GPIO numbering / physical pin):
   +5V → LED Strip 1 Red (VCC)
   GND → LED Strip 1 Black (GND)
   GND → Pi Physical Pin 9 (GND)  ← SHARED GROUND — essential!
+
 ── GF1002 AMPLIFIER ─────────────────────────────────────────────────────────
   VCC  → External 5V supply +5V
   GND  → External 5V supply GND  (shared ground)
@@ -25,6 +26,7 @@ HARDWARE WIRING (BCM GPIO numbering / physical pin):
   AIN- → Pi 3.5mm jack sleeve (ground)
   OUT+ → Speaker +
   OUT- → Speaker -
+
 ── LED STRIPS (SJ-10060-2811 / WS2812B) ────────────────────────────────────
   Strip 1:
     Red   → External 5V supply +5V
@@ -39,6 +41,7 @@ HARDWARE WIRING (BCM GPIO numbering / physical pin):
   PLAY   button: one leg → Pi Physical Pin 13 (GPIO 27)
                  other leg → Pi Physical Pin 14 (GND)
   (Internal pull-up resistors used — no external resistors needed)
+
 ── INSTALL DEPENDENCIES ─────────────────────────────────────────────────────
   sudo apt update
   sudo apt install python3-rpi.gpio
@@ -48,12 +51,20 @@ HARDWARE WIRING (BCM GPIO numbering / physical pin):
   baresip config must have the ctrl_tcp module loaded, e.g. a line:
       module                  ctrl_tcp.so
   in the [modules] section of ~/.baresip/config (or the -f config dir you pass).
+
 ── RUN ──────────────────────────────────────────────────────────────────────
   sudo python3 lamp_control.py
 
-── ABOUT THE BARESIP ctrl_tcp PROTOCOL (read this if dial/hangup don't work) ─
-  ctrl_tcp does NOT take plain-text "/dial ..." style commands. It speaks
-  JSON, framed as a netstring: "<byte-length>:<json-payload>,"
+── LED STATES ───────────────────────────────────────────────────────────────
+  Amber  (solid)   → idle
+  Green  (solid)   → in call / outgoing call connected
+  White  (pulsing) → incoming call ringing (answer by pressing DIAL)
+  Red    (solid)   → recording voice message
+  Blue   (solid)   → playing voice message
+  Magenta (flash)  → error
+
+── ABOUT THE BARESIP ctrl_tcp PROTOCOL ──────────────────────────────────────
+  ctrl_tcp speaks JSON framed as a netstring: "<byte-length>:<json-payload>,"
 
   Command:   {"command": "dial", "params": "sip:alice@atlanta.com"}
   Sent as:   55:{"command": "dial", "params": "sip:alice@atlanta.com"},
@@ -61,13 +72,9 @@ HARDWARE WIRING (BCM GPIO numbering / physical pin):
   Responses/events come back the same way, e.g.:
   {"response": true, "ok": true, "data": "", "token": "..."}
   {"event": true, "class": "call", "type": "CALL_ESTABLISHED", ...}
-
-  The previous version of this script sent raw "/dial sip:...\n" text,
-  which baresip's ctrl_tcp parser silently rejects — so no dial command
-  was ever actually executed (hence: no SIP packets, no LED feedback that
-  reflected reality). This version sends/receives properly framed JSON.
 """
 import time
+import math
 import signal
 import sys
 import socket
@@ -78,6 +85,7 @@ import threading
 import board
 import neopixel
 import RPi.GPIO as GPIO
+
 # ── Configuration ──────────────────────────────────────────────────────────
 REMOTE_IP      = "192.168.10.1"
 REMOTE_USER    = "lampa"
@@ -87,129 +95,175 @@ BARESIP_PORT   = 4444
 MESSAGE_PATH   = "/home/group66/message.wav"
 MIC_DEVICE     = "plughw:2,0"
 SPEAKER_DEVICE = "plughw:1,0"
+
 BTN_DIAL       = 17   # Physical pin 11
 BTN_RECORD     = 24   # Physical pin 18
 BTN_PLAY       = 27   # Physical pin 13
+
 LED_PIN        = board.D18
 LEDS_PER_STRIP = 15
 STRIP_COUNT    = 2
 LED_TOTAL      = LEDS_PER_STRIP * STRIP_COUNT   # 30
 LED_BRIGHTNESS = 0.2
+
 COLOR_IDLE     = (255, 147,  41)   # amber
 COLOR_CALL     = (  0, 255,   0)   # green
 COLOR_RECORD   = (255,   0,   0)   # red
 COLOR_PLAY     = (  0,   0, 255)   # blue
-COLOR_RING     = (255, 147,  41)   # amber flash
-COLOR_ERROR    = (255,   0, 128)   # magenta — something went wrong
+COLOR_RING     = (255, 255, 255)   # white (pulsing for incoming call)
+COLOR_ERROR    = (255,   0, 128)   # magenta
 COLOR_OFF      = (  0,   0,   0)
+
 # ── State ──────────────────────────────────────────────────────────────────
 in_call        = False
 is_recording   = False
 record_proc    = None
 play_proc      = None
-flash_active   = False
-_current_color = None   # track last LED color to avoid redundant writes
 
-# ── remove led calls ──────────────────────────────────────────────────────────────────
-def fill_pixels(color):
-    pass  # LED disabled
+# ── LED engine ────────────────────────────────────────────────────────────
+#
+# All NeoPixel writes happen on a single dedicated thread (_led_worker).
+# Other threads post requests via a (mode, color) tuple into _led_request,
+# protected by _led_lock. The worker wakes on _led_event.
+# This guarantees the NeoPixel object is only ever touched from one thread,
+# eliminating the segfault caused by concurrent pixel writes.
+#
+# Modes:
+#   "solid"  — fill with color and stay
+#   "flash"  — alternate color / off (error blink, finite)
+#   "pulse"  — sine-wave brightness on color (incoming ring)
 
-def set_idle():
-    global flash_active
-    flash_active = False
-    # fill_pixels(COLOR_IDLE)
+_led_lock    = threading.Lock()
+_led_event   = threading.Event()
+_led_request = {"mode": "solid", "color": COLOR_IDLE}
 
-def set_color(color):
-    global flash_active
-    flash_active = False
-    # fill_pixels(color)
-
-def flash_error():
-    pass  # LED disabled
-
-def start_flash():
-    pass  # LED disabled
-# ───────────────────────────────────────────────────────────────────
-
-# ── LED setup ──────────────────────────────────────────────────────────────
 try:
     pixels = neopixel.NeoPixel(
         LED_PIN,
         LED_TOTAL,
         brightness=LED_BRIGHTNESS,
         auto_write=False,
-        pixel_order=neopixel.GRB
+        pixel_order=neopixel.GRB,
     )
     print("[LED] NeoPixel init OK")
 except Exception as e:
     print(f"[LED] FATAL: could not init NeoPixel: {e}")
     sys.exit(1)
-# ── LED helpers ────────────────────────────────────────────────────────────
-def fill_pixels(color):
-    """Write color to all pixels. Skips write if color unchanged."""
-    global _current_color
-    if color == _current_color:
-        return
-    try:
-        pixels.fill(color)
-        pixels.show()
-        _current_color = color
-    except Exception as e:
-        print(f"[LED] ERROR during fill: {e}")
+
+
+def _led_worker():
+    """Single thread that owns all NeoPixel writes."""
+    flash_count  = 0
+    flash_state  = False
+    pulse_phase  = 0.0
+
+    current_mode  = None
+    current_color = None
+
+    while True:
+        # Grab latest request
+        with _led_lock:
+            req = dict(_led_request)
+
+        mode  = req["mode"]
+        color = req["color"]
+
+        # On mode/color change, reset animation state
+        if mode != current_mode or color != current_color:
+            current_mode  = mode
+            current_color = color
+            flash_count   = req.get("flashes", 6)   # total half-periods
+            flash_state   = True
+            pulse_phase   = 0.0
+
+        try:
+            if mode == "solid":
+                pixels.fill(color)
+                pixels.show()
+                # Nothing more to do until next request — wait indefinitely
+                _led_event.clear()
+                _led_event.wait()
+
+            elif mode == "flash":
+                # Finite blink: flash_count half-periods, then go idle
+                if flash_count > 0:
+                    pixels.fill(color if flash_state else COLOR_OFF)
+                    pixels.show()
+                    flash_state = not flash_state
+                    flash_count -= 1
+                    time.sleep(0.15)
+                    # If another request arrived, loop will pick it up
+                    if _led_event.is_set():
+                        _led_event.clear()
+                else:
+                    # Done flashing — return to idle
+                    _post_led("solid", COLOR_IDLE)
+
+            elif mode == "pulse":
+                # Continuous sine-wave pulse; woken by event to check for new req
+                brightness = (math.sin(pulse_phase) + 1.0) / 2.0   # 0..1
+                scaled = tuple(int(c * brightness) for c in color)
+                pixels.fill(scaled)
+                pixels.show()
+                pulse_phase += 0.12   # ~0.5 Hz at 10 ms sleep
+                if pulse_phase > 2 * math.pi:
+                    pulse_phase -= 2 * math.pi
+                # Short sleep; check for new requests frequently
+                _led_event.wait(timeout=0.03)
+                _led_event.clear()
+
+        except Exception as e:
+            print(f"[LED] worker error: {e}")
+            time.sleep(0.5)
+
+
+def _post_led(mode, color, flashes=6):
+    """Thread-safe: post a new LED request and wake the worker."""
+    with _led_lock:
+        _led_request["mode"]    = mode
+        _led_request["color"]   = color
+        _led_request["flashes"] = flashes
+    _led_event.set()
+
+
+# Public LED helpers --------------------------------------------------------
+
 def set_idle():
-    global flash_active
-    flash_active = False
-    time.sleep(0.05)
-    fill_pixels(COLOR_IDLE)
+    _post_led("solid", COLOR_IDLE)
+
 def set_color(color):
-    global flash_active
-    flash_active = False
-    time.sleep(0.05)
-    fill_pixels(color)
+    _post_led("solid", color)
+
 def flash_error():
-    """Brief magenta flash to signal something went wrong, then return to idle."""
-    def _flash():
-        for _ in range(3):
-            fill_pixels(COLOR_ERROR)
-            time.sleep(0.2)
-            fill_pixels(COLOR_OFF)
-            time.sleep(0.2)
-        set_idle()
-    threading.Thread(target=_flash, daemon=True).start()
-def start_flash():
-    """Flash amber for incoming call."""
-    global flash_active
-    flash_active = True
-    def _flash():
-        state = True
-        while flash_active:
-            fill_pixels(COLOR_RING if state else COLOR_OFF)
-            state = not state
-            time.sleep(0.4)
-        fill_pixels(COLOR_OFF)
-    threading.Thread(target=_flash, daemon=True).start()
+    _post_led("flash", COLOR_ERROR, flashes=6)
+
+def start_pulse(color=COLOR_RING):
+    """Pulsing white for incoming ring."""
+    _post_led("pulse", color)
+
+
+# Start the LED worker thread -----------------------------------------------
+_led_thread = threading.Thread(target=_led_worker, daemon=True, name="led-worker")
+_led_thread.start()
+
+# ── State ──────────────────────────────────────────────────────────────────
+in_call        = False
+is_recording   = False
+record_proc    = None
+play_proc      = None
+
 # ── Baresip — single shared persistent connection ──────────────────────────
-#
-# baresip ctrl_tcp accepts only ONE connection at a time, and it speaks
-# JSON-over-netstring, NOT plain text. See module docstring above.
-#
-# We keep one persistent socket open for both sending commands and
-# receiving events. A background thread owns the socket and reads
-# events; commands are written onto the same socket via a lock.
-_baresip_proc  = None          # subprocess handle if we launched baresip
-_bs_socket     = None          # the single live socket
+_baresip_proc  = None
+_bs_socket     = None
 _bs_lock       = threading.Lock()
-_bs_connected  = threading.Event()   # set when socket is live
+_bs_connected  = threading.Event()
+
+
 def start_baresip(wait_secs=8):
-    """
-    Launch baresip -d if not already running.
-    Returns True once the control socket is reachable.
-    """
     global _baresip_proc
     if _bs_connected.is_set():
         print("[baresip] already connected")
         return True
-    # Try a quick probe first (externally started baresip)
     try:
         probe = socket.create_connection((BARESIP_HOST, BARESIP_PORT), timeout=1)
         probe.close()
@@ -217,14 +271,14 @@ def start_baresip(wait_secs=8):
         return True
     except Exception:
         pass
-    # Launch it ourselves
+
     if _baresip_proc is None or _baresip_proc.poll() is not None:
         print("[baresip] launching /usr/bin/baresip -d ...")
         try:
             _baresip_proc = subprocess.Popen(
-    ["/usr/bin/baresip", "-d", "-f", "/home/group66/.baresip"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
+                ["/usr/bin/baresip", "-d", "-f", "/home/group66/.baresip"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except FileNotFoundError:
             print("[baresip] ERROR: /usr/bin/baresip not found")
@@ -232,7 +286,7 @@ def start_baresip(wait_secs=8):
         except Exception as e:
             print(f"[baresip] ERROR launching: {e}")
             return False
-    # Wait for socket to open
+
     deadline = time.time() + wait_secs
     while time.time() < deadline:
         try:
@@ -242,21 +296,22 @@ def start_baresip(wait_secs=8):
             return True
         except Exception:
             time.sleep(0.5)
+
     print(f"[baresip] did not become ready within {wait_secs}s")
     return False
+
+
 def baresip_running():
     return _bs_connected.is_set()
-# ── Netstring framing helpers ───────────────────────────────────────────────
+
+
+# ── Netstring framing ───────────────────────────────────────────────────────
+
 def _netstring_encode(payload: bytes) -> bytes:
-    """djb netstring: '<byte-length>:<payload>,'"""
     return str(len(payload)).encode() + b":" + payload + b","
+
+
 def _netstring_decode_buffer(buf: bytes):
-    """
-    Pull as many complete netstrings as possible out of buf.
-    Returns (list_of_payload_bytes, remaining_buf).
-    Tolerant of partial/garbled data: resyncs on framing errors instead
-    of getting stuck.
-    """
     messages = []
     while True:
         colon = buf.find(b":")
@@ -264,14 +319,13 @@ def _netstring_decode_buffer(buf: bytes):
             break
         length_field = buf[:colon]
         if not length_field.isdigit():
-            # Garbage before a colon — drop it and look for the next one.
             buf = buf[colon + 1:]
             continue
         length = int(length_field)
-        start = colon + 1
-        end = start + length
-        if len(buf) < end + 1:          # +1 for the trailing comma
-            break                        # incomplete — wait for more bytes
+        start  = colon + 1
+        end    = start + length
+        if len(buf) < end + 1:
+            break
         if buf[end:end + 1] != b",":
             print("[baresip] netstring framing error — resyncing")
             buf = buf[start:]
@@ -279,15 +333,9 @@ def _netstring_decode_buffer(buf: bytes):
         messages.append(buf[start:end])
         buf = buf[end + 1:]
     return messages, buf
+
+
 def baresip_cmd(command, params=None, token=None):
-    """
-    Send a JSON command on the shared persistent socket, wrapped in
-    netstring framing, e.g. for command="dial", params="sip:a@b.com":
-        15:{"command": "dial", "params": "sip:a@b.com"},
-    Returns True if the bytes were written to the socket (NOT a
-    guarantee baresip executed it successfully — watch the console for
-    the matching "[baresip] response: ok=..." line).
-    """
     global _bs_socket
     msg = {"command": command}
     if params:
@@ -295,7 +343,7 @@ def baresip_cmd(command, params=None, token=None):
     if token:
         msg["token"] = token
     payload = json.dumps(msg).encode("utf-8")
-    framed = _netstring_encode(payload)
+    framed  = _netstring_encode(payload)
     with _bs_lock:
         if _bs_socket is None:
             print(f"[baresip] not connected — cannot send: {command} {params or ''}")
@@ -307,21 +355,17 @@ def baresip_cmd(command, params=None, token=None):
         except Exception as e:
             print(f"[baresip] send error: {e}")
             return False
+
+
 def start_event_listener():
-    """
-    Background thread: maintains the single persistent socket to baresip.
-    Reads netstring-framed JSON events/responses and dispatches them;
-    commands are sent via baresip_cmd() on the same socket using _bs_lock.
-    """
     def _listen():
         global in_call, _bs_socket
         backoff = 2
         while True:
-            # Wait until baresip is reachable
             while True:
                 try:
                     sock = socket.create_connection((BARESIP_HOST, BARESIP_PORT), timeout=3)
-                    sock.settimeout(None)   # blocking reads from here
+                    sock.settimeout(None)
                     break
                 except Exception:
                     time.sleep(backoff)
@@ -344,29 +388,29 @@ def start_event_listener():
                         try:
                             obj = json.loads(raw.decode(errors="ignore"))
                         except json.JSONDecodeError as e:
-                            print(f"[baresip] bad JSON from baresip: {e}")
+                            print(f"[baresip] bad JSON: {e}")
                             continue
 
                         if obj.get("event"):
                             etype = obj.get("type", "")
                             print(f"[EVENT] {etype} {obj}")
                             if etype == "CALL_INCOMING":
-                                print("[EVENT] Incoming call — flashing")
+                                print("[EVENT] Incoming call — pulsing white")
                                 in_call = False
-                                start_flash()
+                                start_pulse(COLOR_RING)
                             elif etype == "CALL_ESTABLISHED":
-                                print("[EVENT] Call established")
+                                print("[EVENT] Call established — solid green")
                                 in_call = True
                                 set_color(COLOR_CALL)
                             elif etype == "CALL_CLOSED":
-                                print("[EVENT] Call ended")
+                                print("[EVENT] Call ended — amber idle")
                                 in_call = False
                                 set_idle()
                         elif obj.get("response"):
                             print(f"[baresip] response: ok={obj.get('ok')} "
                                   f"data={obj.get('data')!r} token={obj.get('token')}")
                         else:
-                            print(f"[baresip] unrecognized message: {obj}")
+                            print(f"[baresip] unrecognized: {obj}")
             except Exception as e:
                 print(f"[baresip] socket error: {e}")
             finally:
@@ -379,31 +423,35 @@ def start_event_listener():
                     pass
                 print(f"[baresip] reconnecting in {backoff}s...")
                 time.sleep(backoff)
-    threading.Thread(target=_listen, daemon=True).start()
+
+    threading.Thread(target=_listen, daemon=True, name="baresip-listener").start()
+
+
 # ── Button actions ─────────────────────────────────────────────────────────
+
 def action_dial():
-    """Dial the other lamp or hang up if already in call."""
+    """Dial the other lamp, or hang up if already in call."""
     global in_call
     if not _bs_connected.is_set():
         print("[DIAL] baresip not connected — attempting to start...")
-        fill_pixels(COLOR_ERROR)
+        set_color(COLOR_ERROR)
         if not start_baresip(wait_secs=8):
             print("[DIAL] could not start baresip — giving up")
             flash_error()
             return
-        # Wait for the event listener to connect the shared socket
         if not _bs_connected.wait(timeout=6):
             print("[DIAL] socket not ready after start — giving up")
             flash_error()
             return
         print("[DIAL] baresip ready")
+
     if not in_call:
         target = f"sip:{REMOTE_USER}@{REMOTE_IP}"
         print(f"[DIAL] Calling {target} ...")
         ok = baresip_cmd("dial", target)
         if ok:
             in_call = True
-            set_color(COLOR_CALL)
+            set_color(COLOR_CALL)   # green while ringing out / in call
         else:
             print("[DIAL] Failed to send dial command")
             flash_error()
@@ -414,6 +462,8 @@ def action_dial():
             print("[DIAL] Hangup command failed — resetting state anyway")
         in_call = False
         set_idle()
+
+
 def action_record_start():
     """Start recording a voice message via USB mic."""
     global is_recording, record_proc
@@ -423,7 +473,7 @@ def action_record_start():
     if is_recording:
         print("[RECORD] Already recording — ignoring")
         return
-    # Make sure output directory exists
+
     msg_dir = os.path.dirname(MESSAGE_PATH)
     if msg_dir and not os.path.isdir(msg_dir):
         try:
@@ -432,21 +482,24 @@ def action_record_start():
             print(f"[RECORD] Cannot create directory {msg_dir}: {e}")
             flash_error()
             return
+
     print(f"[RECORD] Recording to {MESSAGE_PATH} ...")
     try:
         record_proc = subprocess.Popen(
             ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE",
              "-r", "44100", "-c", "1", "-t", "wav", MESSAGE_PATH],
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
         )
         is_recording = True
-        set_color(COLOR_RECORD)   # LED after process starts → less click
+        set_color(COLOR_RECORD)   # solid red
     except FileNotFoundError:
         print("[RECORD] ERROR: arecord not found — install alsa-utils")
         flash_error()
     except Exception as e:
         print(f"[RECORD] ERROR starting arecord: {e}")
         flash_error()
+
+
 def action_record_stop():
     """Stop recording and save the message."""
     global is_recording, record_proc
@@ -462,13 +515,16 @@ def action_record_stop():
     except Exception as e:
         print(f"[RECORD] ERROR stopping arecord: {e}")
     finally:
-        record_proc = None
-        is_recording = False
+        record_proc    = None
+        is_recording   = False
+
     if os.path.exists(MESSAGE_PATH) and os.path.getsize(MESSAGE_PATH) > 44:
         print(f"[RECORD] Saved {os.path.getsize(MESSAGE_PATH)} bytes to {MESSAGE_PATH}")
     else:
         print(f"[RECORD] WARNING: message file missing or empty at {MESSAGE_PATH}")
     set_idle()
+
+
 def action_play():
     """Play the last recorded voice message through GF1002 speaker."""
     global play_proc
@@ -486,7 +542,7 @@ def action_play():
         print(f"[PLAY] Message file is empty (header only) — nothing to play")
         flash_error()
         return
-    # Stop any current playback
+
     if play_proc and play_proc.poll() is None:
         try:
             play_proc.terminate()
@@ -494,17 +550,19 @@ def action_play():
         except Exception:
             play_proc.kill()
         time.sleep(0.2)
+
     print(f"[PLAY] Playing {MESSAGE_PATH} via {SPEAKER_DEVICE} ...")
     try:
         play_proc = subprocess.Popen(
             ["aplay", "-D", SPEAKER_DEVICE, MESSAGE_PATH],
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
         )
-        time.sleep(0.1)           # let audio start before LED burst → less click
-        set_color(COLOR_PLAY)
+        time.sleep(0.1)
+        set_color(COLOR_PLAY)   # solid blue
+
         def _wait_for_end():
             try:
-                stdout, stderr = play_proc.communicate(timeout=120)
+                _, stderr = play_proc.communicate(timeout=120)
                 if play_proc.returncode != 0 and stderr:
                     print(f"[PLAY] aplay error: {stderr.decode(errors='ignore').strip()}")
             except subprocess.TimeoutExpired:
@@ -515,49 +573,47 @@ def action_play():
             finally:
                 time.sleep(0.2)
                 set_idle()
-        threading.Thread(target=_wait_for_end, daemon=True).start()
+
+        threading.Thread(target=_wait_for_end, daemon=True, name="play-wait").start()
     except FileNotFoundError:
         print("[PLAY] ERROR: aplay not found — install alsa-utils")
         flash_error()
     except Exception as e:
         print(f"[PLAY] ERROR starting aplay: {e}")
         flash_error()
+
+
 # ── GPIO button setup ──────────────────────────────────────────────────────
+
 def setup_buttons():
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
     for pin in (BTN_DIAL, BTN_RECORD, BTN_PLAY):
         GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     print(f"[GPIO] Buttons ready on BCM {BTN_DIAL}, {BTN_RECORD}, {BTN_PLAY}")
+
+
 # ── Cleanup ────────────────────────────────────────────────────────────────
+
 def cleanup():
-    global flash_active
     print("\n[EXIT] Cleaning up...")
-    flash_active = False
-    # Stop recording if active
     if is_recording:
         action_record_stop()
-    # Stop playback if active
     if play_proc and play_proc.poll() is None:
         try:
             play_proc.terminate()
             play_proc.wait(timeout=2)
         except Exception:
             play_proc.kill()
-    # Hang up if in call
     if in_call:
         baresip_cmd("hangup")
     time.sleep(0.1)
-    # Always try to turn off LEDs
-    try:
-        fill_pixels(COLOR_OFF)
-    except Exception as e:
-        print(f"[EXIT] Could not turn off LEDs: {e}")
+    _post_led("solid", COLOR_OFF)
+    time.sleep(0.1)   # give worker time to write
     try:
         GPIO.cleanup()
     except Exception as e:
         print(f"[EXIT] GPIO cleanup error: {e}")
-    # Kill baresip if we launched it
     if _baresip_proc and _baresip_proc.poll() is None:
         print("[EXIT] Stopping baresip...")
         try:
@@ -566,17 +622,22 @@ def cleanup():
         except Exception:
             _baresip_proc.kill()
     print("[EXIT] Done.")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
+
 def main():
     setup_buttons()
-    set_idle()
+    set_idle()   # amber on startup
     start_event_listener()
+
     def handle_exit(sig, frame):
         cleanup()
         sys.exit(0)
+
     signal.signal(signal.SIGINT,  handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
-    # Start baresip then wait for event listener to connect the shared socket
+
     print("[baresip] checking / starting baresip...")
     if start_baresip(wait_secs=8):
         print("[baresip] process up — waiting for socket...")
@@ -586,22 +647,31 @@ def main():
             print("[WARN] baresip started but socket not ready yet — will connect soon")
     else:
         print("[WARN] baresip not ready — will retry when DIAL is pressed")
+
     print("\n══════════════════════════════════════")
     print("  Lamp intercom controller ready")
     print("══════════════════════════════════════")
     print(f"  DIAL   (BCM17 / Pin 11) — call / hang up")
     print(f"  RECORD (BCM24 / Pin 18) — hold to record, release to save")
     print(f"  PLAY   (BCM27 / Pin 13) — play last message")
-    print(f"  LEDs   (BCM18 / Pin 12) → SN74LS125AN → 2× strips (30 LEDs)")
+    print(f"  LEDs   (BCM18 / Pin 12) → 2× strips (30 LEDs)")
+    print(f"    Amber  = idle")
+    print(f"    Green  = in call")
+    print(f"    White pulse = incoming ring")
+    print(f"    Red    = recording")
+    print(f"    Blue   = playing")
+    print(f"    Magenta flash = error")
     print(f"  Speaker via GF1002 on 3.5mm aux")
     print(f"  Mic    via USB ({MIC_DEVICE})")
     print(f"  Remote  sip:{REMOTE_USER}@{REMOTE_IP}")
     print("  Ctrl+C to quit\n")
+
     last_state = {
         BTN_DIAL:   GPIO.HIGH,
         BTN_RECORD: GPIO.HIGH,
         BTN_PLAY:   GPIO.HIGH,
     }
+
     try:
         while True:
             for pin in (BTN_DIAL, BTN_RECORD, BTN_PLAY):
@@ -610,7 +680,9 @@ def main():
                 except Exception as e:
                     print(f"[GPIO] Error reading pin {pin}: {e}")
                     continue
+
                 prev = last_state[pin]
+
                 # Pressed (active LOW)
                 if current == GPIO.LOW and prev == GPIO.HIGH:
                     time.sleep(0.02)   # debounce
@@ -625,6 +697,7 @@ def main():
                     except Exception as e:
                         print(f"[GPIO] Error handling press on pin {pin}: {e}")
                         flash_error()
+
                 # Released
                 if current == GPIO.HIGH and prev == GPIO.LOW:
                     try:
@@ -632,11 +705,16 @@ def main():
                             action_record_stop()
                     except Exception as e:
                         print(f"[GPIO] Error handling release on pin {pin}: {e}")
+
                 last_state[pin] = current
+
             time.sleep(0.01)
+
     except Exception as e:
         print(f"[MAIN] Unexpected error in main loop: {e}")
         cleanup()
         sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
