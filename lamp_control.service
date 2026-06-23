@@ -1,0 +1,18 @@
+[Unit]
+Description=David Lamp Intercom Controller
+After=network.target sound.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/group66
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/group66/lamp_control.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
